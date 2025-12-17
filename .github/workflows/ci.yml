@@ -1,0 +1,556 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      skip_tests:
+        description: 'Skip test execution'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  NODE_VERSION: '20'
+  POSTGRES_VERSION: '16'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================================================
+  # JOB 1: Install Dependencies and Cache
+  # ==========================================================================
+  setup:
+    name: Setup Dependencies
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        id: cache-deps
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            backend/node_modules
+            ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      
+      - name: Install dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          npm ci --prefer-offline --no-audit
+          npm run db:generate
+  
+  # ==========================================================================
+  # JOB 2: Lint and Format Check
+  # ==========================================================================
+  lint:
+    name: Lint and Format
+    runs-on: ubuntu-latest
+    needs: setup
+    
+    strategy:
+      matrix:
+        workspace: [frontend, backend]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Restore dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            backend/node_modules
+            ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+      
+      - name: Run ESLint
+        run: npm run lint:${{ matrix.workspace }}
+      
+      - name: Check formatting
+        run: npm run format:check:${{ matrix.workspace }}
+      
+      - name: TypeScript type check
+        run: npm run typecheck:${{ matrix.workspace }}
+  
+  # ==========================================================================
+  # JOB 3: Run Tests
+  # ==========================================================================
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: setup
+    if: ${{ !inputs.skip_tests }}
+    
+    strategy:
+      matrix:
+        workspace: [frontend, backend]
+    
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: hr_onboarding_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Restore dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            backend/node_modules
+            ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+      
+      - name: Setup test database
+        if: matrix.workspace == 'backend'
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/hr_onboarding_test
+        run: |
+          npm run db:migrate --workspace=backend
+      
+      - name: Run tests with coverage
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/hr_onboarding_test
+          NODE_ENV: test
+        run: npm run test:coverage:${{ matrix.workspace }}
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./${{ matrix.workspace }}/coverage/coverage-final.json
+          flags: ${{ matrix.workspace }}
+          name: ${{ matrix.workspace }}-coverage
+          fail_ci_if_error: false
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ matrix.workspace }}
+          path: |
+            ${{ matrix.workspace }}/coverage/
+            ${{ matrix.workspace }}/test-results/
+          retention-days: 7
+  
+  # ==========================================================================
+  # JOB 4: Security Audit
+  # ==========================================================================
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    needs: setup
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Restore dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            backend/node_modules
+            ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+      
+      - name: Run npm audit
+        run: npm audit --audit-level=moderate
+        continue-on-error: true
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+  
+  # ==========================================================================
+  # JOB 5: Build Docker Images
+  # ==========================================================================
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [lint, test, security]
+    if: github.event_name != 'pull_request'
+    
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    
+    outputs:
+      frontend-tag: ${{ steps.meta-frontend.outputs.tags }}
+      backend-tag: ${{ steps.meta-backend.outputs.tags }}
+      version: ${{ steps.meta-frontend.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata for frontend
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=HR Onboarding Frontend
+            org.opencontainers.image.description=React frontend for HR onboarding system
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+      
+      - name: Extract metadata for backend
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=HR Onboarding Backend
+            org.opencontainers.image.description=Express.js backend for HR onboarding system
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+      
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta-frontend.outputs.version }}
+      
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta-backend.outputs.version }}
+  
+  # ==========================================================================
+  # JOB 6: Scan Container Images
+  # ==========================================================================
+  scan:
+    name: Security Scan Images
+    runs-on: ubuntu-latest
+    needs: build
+    
+    permissions:
+      security-events: write
+    
+    strategy:
+      matrix:
+        image: [frontend, backend]
+    
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs[format('{0}-tag', matrix.image)] }}
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.image }}.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results-${{ matrix.image }}.sarif'
+          category: 'trivy-${{ matrix.image }}'
+  
+  # ==========================================================================
+  # JOB 7: Deploy to Development
+  # ==========================================================================
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: [build, scan]
+    if: github.ref == 'refs/heads/develop'
+    
+    environment:
+      name: development
+      url: https://dev.hr-onboarding.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy via Docker Compose
+        run: |
+          echo "Deploying to development environment..."
+          docker-compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+      
+      - name: Wait for services
+        run: |
+          echo "Waiting for services to be healthy..."
+          sleep 30
+      
+      - name: Run health checks
+        run: |
+          npm run health:check || exit 1
+      
+      - name: Notify deployment
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          text: |
+            Development Deployment: ${{ job.status }}
+            Version: ${{ needs.build.outputs.version }}
+            Commit: ${{ github.sha }}
+            URL: https://dev.hr-onboarding.example.com
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+  
+  # ==========================================================================
+  # JOB 8: Deploy to Staging
+  # ==========================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, scan]
+    if: github.ref == 'refs/heads/main'
+    
+    environment:
+      name: staging
+      url: https://staging.hr-onboarding.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          docker-compose -f docker-compose.yml -f docker-compose.staging.yml up -d
+      
+      - name: Run smoke tests
+        run: |
+          chmod +x ./scripts/smoke-test.sh
+          ./scripts/smoke-test.sh https://staging.hr-onboarding.example.com
+      
+      - name: Run health checks
+        run: |
+          for i in {1..30}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://staging.hr-onboarding.example.com/health)
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Attempt $i: Health check returned $STATUS, retrying..."
+            sleep 10
+          done
+          echo "Health check failed after 30 attempts"
+          exit 1
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed, rolling back..."
+          docker-compose -f docker-compose.yml -f docker-compose.staging.yml down
+          docker-compose -f docker-compose.yml -f docker-compose.staging.yml up -d --force-recreate
+      
+      - name: Notify deployment
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          text: |
+            Staging Deployment: ${{ job.status }}
+            Version: ${{ needs.build.outputs.version }}
+            Commit: ${{ github.sha }}
+            URL: https://staging.hr-onboarding.example.com
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+  
+  # ==========================================================================
+  # JOB 9: Deploy to Production (Requires Manual Approval)
+  # ==========================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, scan, deploy-staging]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
+    
+    environment:
+      name: production
+      url: https://hr-onboarding.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production environment..."
+          docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+      
+      - name: Monitor deployment
+        run: |
+          echo "Monitoring deployment for 120 seconds..."
+          sleep 120
+          
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://hr-onboarding.example.com/health)
+            if [ "$STATUS" -ne 200 ]; then
+              echo "Health check failed with status $STATUS"
+              exit 1
+            fi
+            echo "Health check $i passed"
+            sleep 10
+          done
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed, rolling back..."
+          docker-compose -f docker-compose.yml -f docker-compose.prod.yml down
+          docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d --force-recreate
+      
+      - name: Create GitHub release
+        if: success()
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ needs.build.outputs.version }}
+          release_name: Release v${{ needs.build.outputs.version }}
+          body: |
+            ## Production Release v${{ needs.build.outputs.version }}
+            
+            ### Changes
+            - Deployed to production
+            - Frontend: ${{ needs.build.outputs.frontend-tag }}
+            - Backend: ${{ needs.build.outputs.backend-tag }}
+            - Commit: ${{ github.sha }}
+            
+            ### Deployment Details
+            - Environment: Production
+            - Timestamp: ${{ github.event.head_commit.timestamp }}
+            - Deployed by: ${{ github.actor }}
+          draft: false
+          prerelease: false
+      
+      - name: Notify production deployment
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          text: |
+            🚀 Production Deployment: ${{ job.status }}
+            Version: ${{ needs.build.outputs.version }}
+            Commit: ${{ github.sha }}
+            URL: https://hr-onboarding.example.com
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          channel: '#deployments'
+          mention: 'channel'
