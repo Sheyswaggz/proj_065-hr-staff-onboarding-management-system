@@ -1,0 +1,88 @@
+export default {
+  projects: ['<rootDir>/frontend', '<rootDir>/backend'],
+  coverageDirectory: '<rootDir>/coverage',
+  collectCoverageFrom: [
+    'frontend/src/**/*.{ts,tsx}',
+    'backend/src/**/*.{ts}',
+    '!**/*.d.ts',
+    '!**/node_modules/**',
+    '!**/dist/**',
+    '!**/build/**',
+    '!**/coverage/**',
+    '!**/*.config.{js,ts}',
+    '!**/index.{ts,tsx}',
+    '!**/main.{ts,tsx}',
+    '!**/vite-env.d.ts',
+  ],
+  coverageThreshold: {
+    global: {
+      branches: 90,
+      functions: 90,
+      lines: 90,
+      statements: 90,
+    },
+  },
+  coverageReporters: ['text', 'text-summary', 'lcov', 'html', 'json'],
+  testMatch: [
+    '**/__tests__/**/*.{ts,tsx,js,jsx}',
+    '**/*.{spec,test}.{ts,tsx,js,jsx}',
+  ],
+  testPathIgnorePatterns: [
+    '/node_modules/',
+    '/dist/',
+    '/build/',
+    '/coverage/',
+    '/.vite/',
+    '/.turbo/',
+  ],
+  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
+  moduleNameMapper: {
+    '^@/(.*)$': '<rootDir>/frontend/src/$1',
+    '\\.(css|less|scss|sass)$': 'identity-obj-proxy',
+    '\\.(jpg|jpeg|png|gif|svg|webp)$': '<rootDir>/__mocks__/fileMock.js',
+  },
+  transform: {
+    '^.+\\.tsx?$': [
+      'ts-jest',
+      {
+        tsconfig: {
+          jsx: 'react-jsx',
+          esModuleInterop: true,
+          allowSyntheticDefaultImports: true,
+        },
+      },
+    ],
+  },
+  testEnvironment: 'node',
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
+  globals: {
+    'ts-jest': {
+      isolatedModules: true,
+    },
+  },
+  maxWorkers: '50%',
+  bail: false,
+  verbose: true,
+  errorOnDeprecated: true,
+  clearMocks: true,
+  resetMocks: true,
+  restoreMocks: true,
+  collectCoverage: false,
+  coverageProvider: 'v8',
+  cacheDirectory: '<rootDir>/.jest-cache',
+  moduleDirectories: ['node_modules', '<rootDir>'],
+  roots: ['<rootDir>/frontend', '<rootDir>/backend'],
+  watchPathIgnorePatterns: [
+    '/node_modules/',
+    '/dist/',
+    '/build/',
+    '/coverage/',
+    '/.vite/',
+    '/.turbo/',
+  ],
+  transformIgnorePatterns: [
+    'node_modules/(?!(.*\\.mjs$|@testing-library|lucide-react))',
+  ],
+  testTimeout: 10000,
+  slowTestThreshold: 5,
+};
