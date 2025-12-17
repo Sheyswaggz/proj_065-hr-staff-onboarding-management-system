@@ -1,0 +1,44 @@
+// Prisma schema for HR Staff Onboarding Management System
+// PostgreSQL database with Employee model and proper constraints
+
+generator client {
+  provider = "prisma-client-js"
+  previewFeatures = ["fullTextSearch", "fullTextIndex"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Employee model with comprehensive fields and constraints
+model Employee {
+  id          String   @id @default(cuid())
+  email       String   @unique @db.VarChar(255)
+  firstName   String   @db.VarChar(100)
+  lastName    String   @db.VarChar(100)
+  position    String   @db.VarChar(150)
+  department  String   @db.VarChar(100)
+  startDate   DateTime @db.Date
+  status      EmployeeStatus @default(PENDING)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([email])
+  @@index([status])
+  @@index([department])
+  @@index([startDate])
+  @@index([createdAt(sort: Desc)])
+  @@map("employees")
+}
+
+// Employee status enum for type safety and constraint enforcement
+enum EmployeeStatus {
+  PENDING
+  ACTIVE
+  INACTIVE
+  TERMINATED
+  ON_LEAVE
+
+  @@map("employee_status")
+}
